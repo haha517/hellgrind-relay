@@ -25,7 +25,7 @@ GH_REPO = os.environ.get("GITHUB_REPOSITORY", "")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 QROOT = "/quark/HellGrind"  # /quark 是 Alist 挂载点，必须带
 STAGE = "/tmp/stage"
-TRANSFER_WORKERS = 12
+TRANSFER_WORKERS = 24
 WALK_WORKERS = 6
 T0 = time.time()
 
@@ -56,6 +56,7 @@ def progress_body():
     s = STATE
     el = time.time() - s["started"]
     speed = s["done_bytes_all"] / el if el > 0 else 0
+    speed_new = s["bytes"] / el if el > 0 else 0
     done_n = s["ok"] + s["skip"]
     cur = sorted(s["current"].values())
     cur_txt = "\n".join(f"- `{os.path.basename(c)}`" for c in cur) or "- （无）"
@@ -65,7 +66,8 @@ def progress_body():
             f"| 已发现文件 | {s['scanned']:,} |\n"
             f"| 已处理 | {done_n:,}（新传 {s['ok']:,}、已存在跳过 {s['skip']:,}、失败 {s['fail']}） |\n"
             f"| 已传数据 | {s['done_bytes_all']/1e9:.2f} GB（其中新传 {s['bytes']/1e9:.2f} GB） |\n"
-            f"| 平均速度 | {speed/1e6:.2f} MB/s |\n"
+            f"| 平均速度（处理口径，含秒跳过） | {speed/1e6:.2f} MB/s |\n"
+            f"| 平均速度（新传数据） | {speed_new/1e6:.2f} MB/s |\n"
             f"| 已运行 | {el/60:.0f} 分钟 |\n")
     if s["scan_done"] and s["total"]:
         pctb = 100.0 * s["done_bytes_all"] / s["total_bytes"] if s["total_bytes"] else 0
