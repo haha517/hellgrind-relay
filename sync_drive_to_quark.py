@@ -116,14 +116,31 @@ def log(*a):
     print(f"[{time.time() - T0:7.1f}s]", *a, flush=True)
 
 
-def execute_retry(req, tries=8):
-    """Drive API 偶发 429/5xx 时指数退避重试（googleapiclient 的请求对象可重放）。"""
+_QUOTA_UNTIL = [0.0]
+
+
+def _is_quota_error(e):
+    body = str(getattr(e, "content", b"") or "") + str(e)
+    return (e.resp.status in (403, 429) and
+            ("rateLimitExceeded" in body or "userRateLimitExceeded" in body
+             or "Quota exceeded" in body or "quotaExceeded" in body))
+
+
+def execute_retry(req, tries=10):
+    """Drive API 偶发 429/5xx 与配额 403 时退避重试；配额错误触发全员冷却。"""
     last = None
     for i in range(tries):
+        wait = _QUOTA_UNTIL[0] - time.time()
+        if wait > 0:
+            time.sleep(min(wait, 130))
         try:
             return req.execute()
         except HttpError as e:
             last = e
+            if _is_quota_error(e):
+                _QUOTA_UNTIL[0] = time.time() + 65
+                time.sleep(min(120, 5 * (2 ** i)) + random.random() * 3)
+                continue
             if e.resp.status not in (429, 500, 502, 503):
                 raise
             time.sleep(min(60, 2 ** i) + random.random())
@@ -260,7 +277,8 @@ def drive_walk(svc, folder_id, prefix=""):
                 return out
 
     queue = deque([(folder_id, prefix)])
-    with ThreadPoolExecutor(max_workers=16) as ex:
+    failed = []
+    with ThreadPoolExecutor(max_workers=6) as ex:
         while queue:
             futs = {}
             batch = []
@@ -270,7 +288,14 @@ def drive_walk(svc, folder_id, prefix=""):
                 futs[ex.submit(list_folder, fid)] = (fid, pre)
             for fut in as_completed(futs):
                 fid, pre = futs[fut]
-                for f in fut.result():
+                try:
+                    files = fut.result()
+                except Exception as e:
+                    log("folder list failed, queued for rescan:", pre or "/",
+                        str(e)[:100])
+                    failed.append((fid, pre))
+                    continue
+                for f in files:
                     rel = f"{pre}/{f['name']}" if pre else f["name"]
                     if f["mimeType"] == "application/vnd.google-apps.folder":
                         queue.append((f["id"], rel))
@@ -279,6 +304,27 @@ def drive_walk(svc, folder_id, prefix=""):
                             results.append((rel, f["id"],
                                             int(f.get("size", 0))))
                             STATE["scanned"] = len(results)
+    for fid, pre in failed:
+        queue.append((fid, pre))
+    retry_failed = []
+    while queue:
+        fid, pre = queue.popleft()
+        try:
+            files = list_folder(fid)
+        except Exception as e:
+            log("rescan failed:", pre or "/", str(e)[:100])
+            retry_failed.append(pre or "/")
+            continue
+        for f in files:
+            rel = f"{pre}/{f['name']}" if pre else f["name"]
+            if f["mimeType"] == "application/vnd.google-apps.folder":
+                queue.append((f["id"], rel))
+            else:
+                results.append((rel, f["id"], int(f.get("size", 0))))
+                STATE["scanned"] = len(results)
+    if retry_failed:
+        log("SCAN INCOMPLETE, folders missed:", len(retry_failed))
+        STATE["phase"] = "传输中（扫描缺 " + str(len(retry_failed)) + " 个文件夹，下轮补）"
     return results
 
 
@@ -300,7 +346,8 @@ def main():
         raise RuntimeError("media/ not found under DRIVE_ROOT (check SA sharing)")
     STATE["phase"] = "扫描网盘文件树"
     items = drive_walk(svc, kids[0]["id"], "media")
-    STATE["phase"] = "传输中"
+    if not STATE["phase"].startswith("传输中"):
+        STATE["phase"] = "传输中"
     STATE["total"] = len(items)
     STATE["total_bytes"] = sum(x[2] for x in items)
     if INCLUDE_FILM:
