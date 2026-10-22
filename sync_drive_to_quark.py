@@ -215,7 +215,22 @@ class Alist:
 
 
 # ---------------- Drive ----------------
+import threading as _th
+_TLS = _th.local()
+
+
 def drive_service():
+    if getattr(_TLS, "svc", None) is None:
+        with open("/tmp/sa.json", "w") as f:
+            f.write(SA_JSON)
+        creds = service_account.Credentials.from_service_account_file(
+            "/tmp/sa.json",
+            scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        _TLS.svc = build("drive", "v3", credentials=creds)
+    return _TLS.svc
+
+
+def _build_service():
     with open("/tmp/sa.json", "w") as f:
         f.write(SA_JSON)
     creds = service_account.Credentials.from_service_account_file(
@@ -250,7 +265,7 @@ def main():
     alist = Alist()
     alist.start()
     alist.mount_quark()
-    svc = drive_service()
+    svc = _build_service()
 
     kids = execute_retry(svc.files().list(
         q=f"'{DRIVE_ROOT}' in parents and name='media' and trashed=false",
@@ -290,7 +305,8 @@ def main():
         local = os.path.join(STAGE, f"{fid}_{os.path.basename(qpath)}")
         try:
             with open(local, "wb") as fh:
-                dl = MediaIoBaseDownload(fh, svc.files().get_media(fileId=fid))
+                dl = MediaIoBaseDownload(
+                    fh, drive_service().files().get_media(fileId=fid))
                 done = False
                 while not done:
                     _, done = dl.next_chunk(num_retries=5)
