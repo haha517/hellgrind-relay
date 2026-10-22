@@ -209,7 +209,7 @@ class Alist:
                             headers_extra={
                                 "File-Path": urllib.parse.quote(qpath),
                                 "Content-Length": str(size)},
-                            timeout=3600)
+                            timeout=900)
         if resp.get("code") != 200:
             raise RuntimeError(f"put failed {qpath}: {resp}")
 
@@ -306,7 +306,7 @@ def main():
             if budget_left() < 300:
                 log(f"budget reached; {len(pending)} items left for next run")
                 break
-            batch, pending = pending[:200], pending[200:]
+            batch, pending = pending[:20], pending[20:]
             futs = {ex.submit(one, it): it for it in batch}
             for fut in as_completed(futs):
                 try:
