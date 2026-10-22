@@ -22,6 +22,91 @@ DRIVE_ROOT = os.environ.get("DRIVE_ROOT_ID", "1ZtIeCOD69NZ8F_8XECr_dnz6c1z8NjUk"
 BUDGET_MIN = int(os.environ.get("BUDGET_MINUTES", "300"))
 INCLUDE_FILM = os.environ.get("INCLUDE_FILM", "false") == "true"
 QROOT = "/HellGrind"
+GH_REPO = os.environ.get("GITHUB_REPOSITORY", "")
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+STATE = {"phase": "启动", "scanned": 0, "total": 0, "total_bytes": 0,
+         "ok": 0, "skip": 0, "fail": 0, "bytes": 0, "started": time.time()}
+
+
+def _bar(done, total, width=24):
+    if total <= 0:
+        return "░" * width
+    fill = int(width * done / total)
+    return "█" * fill + "░" * (width - fill)
+
+
+def progress_body():
+    s = STATE
+    el = time.time() - s["started"]
+    speed = s["bytes"] / el if el > 0 else 0
+    if s["total"]:
+        done_n = s["ok"] + s["skip"]
+        pct = 100.0 * done_n / s["total"]
+        pctb = 100.0 * s["bytes"] / s["total_bytes"] if s["total_bytes"] else 0
+        eta = (s["total_bytes"] - s["bytes"]) / speed if speed > 0 else 0
+        core = (f"### {_bar(done_n, s['total'])} {pct:.1f}%（按文件数）\n\n"
+                f"| 指标 | 值 |\n| --- | --- |\n"
+                f"| 阶段 | {s['phase']} |\n"
+                f"| 文件 | {done_n:,} / {s['total']:,}（新传 {s['ok']:,}、已存在跳过 {s['skip']:,}、失败 {s['fail']}） |\n"
+                f"| 数据量 | {s['bytes']/1e9:.2f} / {s['total_bytes']/1e9:.2f} GB（{pctb:.1f}%） |\n"
+                f"| 平均速度 | {speed/1e6:.2f} MB/s |\n"
+                f"| 预计剩余 | {eta/60:.0f} 分钟 |\n"
+                f"| 已运行 | {el/60:.0f} 分钟 |\n")
+    else:
+        core = (f"### 扫描中… 已发现 {s['scanned']:,} 个文件\n\n"
+                f"阶段：{s['phase']}（先把网盘文件树完整清点一遍才开始传，"
+                f"这是为了算得出总进度）\n\n已运行 {el/60:.0f} 分钟")
+    import datetime
+    return ("## 📊 Drive → 夸克同步进度（自动更新）\n\n" + core +
+            f"\n\n_最后更新：{datetime.datetime.now().strftime('%H:%M:%S')}_")
+
+
+class ProgressReporter:
+    def __init__(self):
+        self.issue = None
+        self.stop = False
+        if not (GH_REPO and GH_TOKEN):
+            return
+        h = {"Authorization": f"Bearer {GH_TOKEN}",
+             "Accept": "application/vnd.github+json"}
+        self.h = h
+        try:
+            r = requests.get(f"https://api.github.com/repos/{GH_REPO}/issues",
+                             headers=h, params={"state": "open"}, timeout=30)
+            for it in r.json():
+                if it["title"].startswith("📊 同步进度"):
+                    self.issue = it["number"]
+                    break
+            if not self.issue:
+                r = requests.post(f"https://api.github.com/repos/{GH_REPO}/issues",
+                                  headers=h, timeout=30,
+                                  json={"title": "📊 同步进度（自动更新）",
+                                        "body": progress_body()})
+                self.issue = r.json()["number"]
+            log("progress issue:", self.issue)
+        except Exception as e:
+            log("progress issue setup failed:", str(e)[:120])
+
+    def run(self):
+        if not self.issue:
+            return
+        while not self.stop:
+            try:
+                requests.patch(
+                    f"https://api.github.com/repos/{GH_REPO}/issues/{self.issue}",
+                    headers=self.h, json={"body": progress_body()}, timeout=30)
+            except Exception:
+                pass
+            for _ in range(6):
+                if self.stop:
+                    break
+                time.sleep(10)
+        try:
+            requests.patch(
+                f"https://api.github.com/repos/{GH_REPO}/issues/{self.issue}",
+                headers=self.h, json={"body": progress_body()}, timeout=30)
+        except Exception:
+            pass
 STAGE = "/tmp/stage"
 WORKERS = 4
 T0 = time.time()
@@ -158,6 +243,10 @@ def drive_walk(svc, folder_id, prefix=""):
 
 def main():
     os.makedirs(STAGE, exist_ok=True)
+    import threading
+    rep = ProgressReporter()
+    th = threading.Thread(target=rep.run, daemon=True)
+    th.start()
     alist = Alist()
     alist.start()
     alist.mount_quark()
@@ -168,7 +257,14 @@ def main():
         fields="files(id)")).get("files", [])
     if not kids:
         raise RuntimeError("media/ not found under DRIVE_ROOT (check SA sharing)")
-    items = list(drive_walk(svc, kids[0]["id"], "media"))
+    STATE["phase"] = "扫描网盘文件树"
+    items = []
+    for _it in drive_walk(svc, kids[0]["id"], "media"):
+        items.append(_it)
+        STATE["scanned"] = len(items)
+    STATE["phase"] = "传输中"
+    STATE["total"] = len(items)
+    STATE["total_bytes"] = sum(x[2] for x in items)
     if INCLUDE_FILM:
         films = execute_retry(svc.files().list(
             q=f"'{DRIVE_ROOT}' in parents and name contains '.mov' and trashed=false",
@@ -220,12 +316,18 @@ def main():
                         done_bytes += size
                     elif kind == "skip":
                         n_skip += 1
+                        done_bytes += futs[fut][2]
                 except Exception as e:
                     n_fail += 1
                     log("FAIL", futs[fut][0], str(e)[:160])
+                STATE.update(ok=n_ok, skip=n_skip, fail=n_fail, bytes=done_bytes)
             log(f"progress: ok={n_ok} skip={n_skip} fail={n_fail} "
                 f"bytes={done_bytes/1e9:.2f}GB budget_left={budget_left()/60:.0f}m")
+    STATE["phase"] = "本轮结束（重跑 workflow 续传剩余部分）"
+    STATE.update(ok=n_ok, skip=n_skip, fail=n_fail, bytes=done_bytes)
     log(f"DONE ok={n_ok} skip={n_skip} fail={n_fail} bytes={done_bytes/1e9:.2f}GB")
+    rep.stop = True
+    th.join(timeout=40)
     return 0
 
 
