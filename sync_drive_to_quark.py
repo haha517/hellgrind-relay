@@ -23,7 +23,7 @@ BUDGET_MIN = int(os.environ.get("BUDGET_MINUTES", "300"))
 INCLUDE_FILM = os.environ.get("INCLUDE_FILM", "false") == "true"
 GH_REPO = os.environ.get("GITHUB_REPOSITORY", "")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
-QROOT = "/HellGrind"
+QROOT = "/quark/HellGrind"  # /quark 是 Alist 挂载点，必须带
 STAGE = "/tmp/stage"
 TRANSFER_WORKERS = 4
 WALK_WORKERS = 6
@@ -185,6 +185,11 @@ class Alist:
         while True:
             r = self.api("/api/fs/list",
                          {"path": qdir, "page": page, "per_page": 200})
+            if r.get("code") not in (200,) and page == 1:
+                # 目录不存在时夸克驱动返回错误码：视为�空目录，但其他错误要报出来
+                if "not found" in str(r.get("message", "")).lower() or r.get("code") == 500:
+                    return {}
+                raise RuntimeError(f"quark list failed {qdir}: {r}")
             content = (r.get("data") or {}).get("content") or []
             for c in content:
                 out[c["name"]] = int(c.get("size", 0))
