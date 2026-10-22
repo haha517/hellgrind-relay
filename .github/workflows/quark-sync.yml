@@ -1,0 +1,45 @@
+name: Drive to Quark sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_minutes:
+        description: "本轮最多传输多少分钟（到点干净退出，下次重跑续传）"
+        required: false
+        default: "300"
+      include_film:
+        description: "是否包含正片 .mov（13.75GB 单文件，夸克可能装不下）"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install python deps
+        run: pip install -q google-api-python-client google-auth requests
+
+      - name: Install Alist
+        run: |
+          mkdir -p alist-bin
+          cd alist-bin
+          curl -sL https://github.com/alist-org/alist/releases/latest/download/alist-linux-amd64.tar.gz -o a.tgz
+          tar -xzf a.tgz && rm a.tgz
+          ./alist version || true
+
+      - name: Sync Drive -> Quark
+        env:
+          QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          DRIVE_ROOT_ID: "1ZtIeCOD69NZ8F_8XECr_dnz6c1z8NjUk"
+          BUDGET_MINUTES: ${{ inputs.budget_minutes }}
+          INCLUDE_FILM: ${{ inputs.include_film }}
+        run: python3 sync_drive_to_quark.py
