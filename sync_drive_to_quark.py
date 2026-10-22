@@ -8,8 +8,11 @@
 import io, json, os, secrets, subprocess, sys, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import random
+
 import requests
 from google.oauth2 import service_account
+from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
@@ -26,6 +29,20 @@ T0 = time.time()
 
 def log(*a):
     print(f"[{time.time() - T0:7.1f}s]", *a, flush=True)
+
+
+def execute_retry(req, tries=8):
+    """Drive API 偶发 429/5xx 时指数退避重试（googleapiclient 的请求对象可重放）。"""
+    last = None
+    for i in range(tries):
+        try:
+            return req.execute()
+        except HttpError as e:
+            last = e
+            if e.resp.status not in (429, 500, 502, 503):
+                raise
+            time.sleep(min(60, 2 ** i) + random.random())
+    raise last
 
 
 def budget_left():
@@ -124,10 +141,10 @@ def drive_service():
 def drive_walk(svc, folder_id, prefix=""):
     page = None
     while True:
-        r = svc.files().list(
+        r = execute_retry(svc.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
             fields="files(id,name,mimeType,size),nextPageToken",
-            pageToken=page).execute()
+            pageSize=1000, pageToken=page))
         for f in r.get("files", []):
             rel = f"{prefix}/{f['name']}" if prefix else f["name"]
             if f["mimeType"] == "application/vnd.google-apps.folder":
@@ -146,21 +163,21 @@ def main():
     alist.mount_quark()
     svc = drive_service()
 
-    kids = svc.files().list(
+    kids = execute_retry(svc.files().list(
         q=f"'{DRIVE_ROOT}' in parents and name='media' and trashed=false",
-        fields="files(id)").execute().get("files", [])
+        fields="files(id)")).get("files", [])
     if not kids:
         raise RuntimeError("media/ not found under DRIVE_ROOT (check SA sharing)")
     items = list(drive_walk(svc, kids[0]["id"], "media"))
     if INCLUDE_FILM:
-        films = svc.files().list(
+        films = execute_retry(svc.files().list(
             q=f"'{DRIVE_ROOT}' in parents and name contains '.mov' and trashed=false",
-            fields="files(id,name,size)").execute().get("files", [])
+            fields="files(id,name,size)")).get("files", [])
         for f in films:
             items.append((f["name"], f["id"], int(f.get("size", 0))))
-    meta = svc.files().list(
+    meta = execute_retry(svc.files().list(
         q=f"'{DRIVE_ROOT}' in parents and name='hell_grind_metadata.zip' and trashed=false",
-        fields="files(id,name,size)").execute().get("files", [])
+        fields="files(id,name,size)")).get("files", [])
     for f in meta:
         items.append((f["name"], f["id"], int(f.get("size", 0))))
     log(f"drive items: {len(items)}")
@@ -180,7 +197,7 @@ def main():
                 dl = MediaIoBaseDownload(fh, svc.files().get_media(fileId=fid))
                 done = False
                 while not done:
-                    _, done = dl.next_chunk()
+                    _, done = dl.next_chunk(num_retries=5)
             alist.put(local, qpath, size)
             return ("ok", rel, size)
         finally:
