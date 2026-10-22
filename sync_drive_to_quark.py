@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Google Drive -> Quark(夸克网盘) 增量同步，在 GitHub Actions runner 内运行。
+"""Google Drive -> Quark(夸克网盘) 同步，GitHub Actions runner 内运行（v4 流式）。
 
-读端：Google 服务账号（只读被共享的网盘文件夹）。
-写端：本机 Alist 的夸克驱动（Cookie 来自仓库 Secret，绝不打印）。
-幂等：夸克侧同名同大小跳过；随时重跑续传。预算到点干净退出（exit 0）。
+边扫边传：目录遍历是生产者，发现一个文件就入队，传输工人立刻开传；
+进度 Issue 实时显示正在传的文件名。幂等（同名同大小跳过），可无限重跑续传。
+读端：Google 服务账号（只读）。写端：本机 Alist 夸克驱动（Cookie 来自 Secret）。
 """
-import io, json, os, secrets, subprocess, sys, time, urllib.parse
+import json, os, queue, secrets, ssl, subprocess, sys, threading, time
+import http.client
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import random
 
 import requests
 from google.oauth2 import service_account
-from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 QUARK_COOKIE = os.environ["QUARK_COOKIE"]
@@ -21,13 +21,29 @@ SA_JSON = os.environ["GOOGLE_SA_JSON"]
 DRIVE_ROOT = os.environ.get("DRIVE_ROOT_ID", "1ZtIeCOD69NZ8F_8XECr_dnz6c1z8NjUk")
 BUDGET_MIN = int(os.environ.get("BUDGET_MINUTES", "300"))
 INCLUDE_FILM = os.environ.get("INCLUDE_FILM", "false") == "true"
-QROOT = "/HellGrind"
 GH_REPO = os.environ.get("GITHUB_REPOSITORY", "")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
-STATE = {"phase": "启动", "scanned": 0, "total": 0, "total_bytes": 0,
-         "ok": 0, "skip": 0, "fail": 0, "bytes": 0, "started": time.time()}
+QROOT = "/HellGrind"
+STAGE = "/tmp/stage"
+TRANSFER_WORKERS = 4
+WALK_WORKERS = 6
+T0 = time.time()
+
+STATE = {"phase": "启动", "scanned": 0, "scan_done": False, "total": 0,
+         "total_bytes": 0, "ok": 0, "skip": 0, "fail": 0, "bytes": 0,
+         "done_bytes_all": 0, "started": T0, "current": {}}
+_LOCK = threading.Lock()
 
 
+def log(*a):
+    print(f"[{time.time() - T0:7.1f}s]", *a, flush=True)
+
+
+def budget_left():
+    return BUDGET_MIN * 60 - (time.time() - T0)
+
+
+# ---------------- 进度上报（Issue 实时页） ----------------
 def _bar(done, total, width=24):
     if total <= 0:
         return "░" * width
@@ -36,29 +52,29 @@ def _bar(done, total, width=24):
 
 
 def progress_body():
+    import datetime
     s = STATE
     el = time.time() - s["started"]
-    speed = s["bytes"] / el if el > 0 else 0
-    if s["total"]:
-        done_n = s["ok"] + s["skip"]
-        pct = 100.0 * done_n / s["total"]
-        pctb = 100.0 * s["bytes"] / s["total_bytes"] if s["total_bytes"] else 0
-        eta = (s["total_bytes"] - s["bytes"]) / speed if speed > 0 else 0
-        core = (f"### {_bar(done_n, s['total'])} {pct:.1f}%（按文件数）\n\n"
-                f"| 指标 | 值 |\n| --- | --- |\n"
-                f"| 阶段 | {s['phase']} |\n"
-                f"| 文件 | {done_n:,} / {s['total']:,}（新传 {s['ok']:,}、已存在跳过 {s['skip']:,}、失败 {s['fail']}） |\n"
-                f"| 数据量 | {s['bytes']/1e9:.2f} / {s['total_bytes']/1e9:.2f} GB（{pctb:.1f}%） |\n"
-                f"| 平均速度 | {speed/1e6:.2f} MB/s |\n"
-                f"| 预计剩余 | {eta/60:.0f} 分钟 |\n"
-                f"| 已运行 | {el/60:.0f} 分钟 |\n")
-    else:
-        core = (f"### 扫描中… 已发现 {s['scanned']:,} 个文件\n\n"
-                f"阶段：{s['phase']}（先把网盘文件树完整清点一遍才开始传，"
-                f"这是为了算得出总进度）\n\n已运行 {el/60:.0f} 分钟")
-    import datetime
-    return ("## 📊 Drive → 夸克同步进度（自动更新）\n\n" + core +
-            f"\n\n_最后更新：{datetime.datetime.now().strftime('%H:%M:%S')}_")
+    speed = s["done_bytes_all"] / el if el > 0 else 0
+    done_n = s["ok"] + s["skip"]
+    cur = sorted(s["current"].values())
+    cur_txt = "\n".join(f"- `{os.path.basename(c)}`" for c in cur) or "- （无）"
+    head = (f"## 📊 Drive → 夸克同步进度（自动更新）\n\n"
+            f"| 指标 | 值 |\n| --- | --- |\n"
+            f"| 阶段 | {s['phase']} |\n"
+            f"| 已发现文件 | {s['scanned']:,} |\n"
+            f"| 已处理 | {done_n:,}（新传 {s['ok']:,}、已存在跳过 {s['skip']:,}、失败 {s['fail']}） |\n"
+            f"| 已传数据 | {s['done_bytes_all']/1e9:.2f} GB（其中新传 {s['bytes']/1e9:.2f} GB） |\n"
+            f"| 平均速度 | {speed/1e6:.2f} MB/s |\n"
+            f"| 已运行 | {el/60:.0f} 分钟 |\n")
+    if s["scan_done"] and s["total"]:
+        pctb = 100.0 * s["done_bytes_all"] / s["total_bytes"] if s["total_bytes"] else 0
+        eta = (s["total_bytes"] - s["done_bytes_all"]) / speed if speed > 0 else 0
+        head += (f"| 总进度 | {_bar(done_n, s['total'])} {100.0*done_n/s['total']:.1f}%"
+                 f"（数据量 {pctb:.1f}%） |\n"
+                 f"| 预计剩余 | {eta/60:.0f} 分钟 |\n")
+    return (head + f"\n**正在传：**\n{cur_txt}\n\n"
+            f"_最后更新：{datetime.datetime.now().strftime('%H:%M:%S')}_")
 
 
 class ProgressReporter:
@@ -67,21 +83,20 @@ class ProgressReporter:
         self.stop = False
         if not (GH_REPO and GH_TOKEN):
             return
-        h = {"Authorization": f"Bearer {GH_TOKEN}",
-             "Accept": "application/vnd.github+json"}
-        self.h = h
+        self.h = {"Authorization": f"Bearer {GH_TOKEN}",
+                  "Accept": "application/vnd.github+json"}
         try:
             r = requests.get(f"https://api.github.com/repos/{GH_REPO}/issues",
-                             headers=h, params={"state": "open"}, timeout=30)
+                             headers=self.h, params={"state": "open"}, timeout=30)
             for it in r.json():
                 if it["title"].startswith("📊 同步进度"):
                     self.issue = it["number"]
                     break
             if not self.issue:
-                r = requests.post(f"https://api.github.com/repos/{GH_REPO}/issues",
-                                  headers=h, timeout=30,
-                                  json={"title": "📊 同步进度（自动更新）",
-                                        "body": progress_body()})
+                r = requests.post(
+                    f"https://api.github.com/repos/{GH_REPO}/issues",
+                    headers=self.h, timeout=30,
+                    json={"title": "📊 同步进度（自动更新）", "body": progress_body()})
                 self.issue = r.json()["number"]
             log("progress issue:", self.issue)
         except Exception as e:
@@ -107,48 +122,6 @@ class ProgressReporter:
                 headers=self.h, json={"body": progress_body()}, timeout=30)
         except Exception:
             pass
-STAGE = "/tmp/stage"
-WORKERS = 4
-T0 = time.time()
-
-
-def log(*a):
-    print(f"[{time.time() - T0:7.1f}s]", *a, flush=True)
-
-
-_QUOTA_UNTIL = [0.0]
-
-
-def _is_quota_error(e):
-    body = str(getattr(e, "content", b"") or "") + str(e)
-    return (e.resp.status in (403, 429) and
-            ("rateLimitExceeded" in body or "userRateLimitExceeded" in body
-             or "Quota exceeded" in body or "quotaExceeded" in body))
-
-
-def execute_retry(req, tries=10):
-    """Drive API 偶发 429/5xx 与配额 403 时退避重试；配额错误触发全员冷却。"""
-    last = None
-    for i in range(tries):
-        wait = _QUOTA_UNTIL[0] - time.time()
-        if wait > 0:
-            time.sleep(min(wait, 130))
-        try:
-            return req.execute()
-        except HttpError as e:
-            last = e
-            if _is_quota_error(e):
-                _QUOTA_UNTIL[0] = time.time() + 65
-                time.sleep(min(120, 5 * (2 ** i)) + random.random() * 3)
-                continue
-            if e.resp.status not in (429, 500, 502, 503):
-                raise
-            time.sleep(min(60, 2 ** i) + random.random())
-    raise last
-
-
-def budget_left():
-    return BUDGET_MIN * 60 - (time.time() - T0)
 
 
 # ---------------- Alist ----------------
@@ -156,6 +129,8 @@ class Alist:
     def __init__(self):
         self.pw = "hg-" + secrets.token_hex(5)
         self.token = None
+        self._qcache = {}
+        self._qlock = threading.Lock()
 
     def api(self, path, body=None, raw=None, headers_extra=None, timeout=180):
         url = "http://localhost:5244" + path
@@ -202,11 +177,10 @@ class Alist:
             raise RuntimeError(f"quark list failed (cookie invalid?): {lst}")
         log("quark reachable")
 
-    _qcache = {}
-
     def quark_map(self, qdir):
-        if qdir in self._qcache:
-            return self._qcache[qdir]
+        with self._qlock:
+            if qdir in self._qcache:
+                return self._qcache[qdir]
         out, page = {}, 1
         while True:
             r = self.api("/api/fs/list",
@@ -217,10 +191,12 @@ class Alist:
             if len(content) < 200:
                 break
             page += 1
-        self._qcache[qdir] = out
+        with self._qlock:
+            self._qcache[qdir] = out
         return out
 
     def put(self, local, qpath, size):
+        import urllib.parse
         with open(local, "rb") as fh:
             resp = self.api("/api/fs/put", raw=fh,
                             headers_extra={
@@ -232,12 +208,12 @@ class Alist:
 
 
 # ---------------- Drive ----------------
-import threading as _th
-_TLS = _th.local()
-
-
 _SA_INFO = json.loads(SA_JSON)
 _SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+_TLS = threading.local()
+_QUOTA_UNTIL = [0.0]
+_TRANSPORT_ERRORS = (ssl.SSLError, ConnectionError, TimeoutError, OSError,
+                     http.client.HTTPException)
 
 
 def _make_service():
@@ -252,166 +228,213 @@ def drive_service():
     return _TLS.svc
 
 
-def _build_service():
-    return _make_service()
+def _is_quota_error(e):
+    body = str(getattr(e, "content", b"") or "") + str(e)
+    return (e.resp.status in (403, 429) and
+            ("rateLimitExceeded" in body or "userRateLimitExceeded" in body
+             or "Quota exceeded" in body or "quotaExceeded" in body))
 
 
-def drive_walk(svc, folder_id, prefix=""):
-    """并行 BFS 遍历：16 线程并发列文件夹（每线程独立 Drive service）。"""
-    from collections import deque
-    results = []
-    lock = _th.Lock()
+def execute_retry(req, tries=10):
+    """HTTP 429/5xx、配额 403、以及传输层断裂（SSL EOF 等）统一退避重试。"""
+    import random
+    last = None
+    for i in range(tries):
+        wait = _QUOTA_UNTIL[0] - time.time()
+        if wait > 0:
+            time.sleep(min(wait, 130))
+        try:
+            return req.execute()
+        except HttpError as e:
+            last = e
+            if _is_quota_error(e):
+                _QUOTA_UNTIL[0] = time.time() + 65
+                time.sleep(min(120, 5 * (2 ** i)) + random.random() * 3)
+                continue
+            if e.resp.status not in (429, 500, 502, 503):
+                raise
+            time.sleep(min(60, 2 ** i) + random.random())
+        except _TRANSPORT_ERRORS as e:
+            last = e
+            time.sleep(min(60, 2 ** i) + random.random())
+    raise last
 
-    def list_folder(fid):
-        svc_l = drive_service()
-        out = []
-        page = None
-        while True:
-            r = execute_retry(svc_l.files().list(
-                q=f"'{fid}' in parents and trashed=false",
-                fields="files(id,name,mimeType,size),nextPageToken",
-                pageSize=1000, pageToken=page))
-            out.extend(r.get("files", []))
-            page = r.get("nextPageToken")
-            if not page:
-                return out
 
-    queue = deque([(folder_id, prefix)])
+def list_folder(fid):
+    svc = drive_service()
+    out, page = [], None
+    while True:
+        r = execute_retry(svc.files().list(
+            q=f"'{fid}' in parents and trashed=false",
+            fields="files(id,name,mimeType,size),nextPageToken",
+            pageSize=1000, pageToken=page))
+        out.extend(r.get("files", []))
+        page = r.get("nextPageToken")
+        if not page:
+            return out
+
+
+def walk_producer(root_fid, prefix, item_q, extra_items):
+    """BFS 遍历网盘，发现文件立刻入队；失败文件夹最后补扫一遍。"""
     failed = []
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        while queue:
-            futs = {}
+    q = deque([(root_fid, prefix)])
+
+    def emit(rel, fid, size):
+        item_q.put((rel, fid, size))
+        with _LOCK:
+            STATE["scanned"] += 1
+            STATE["total_bytes"] += size
+
+    with ThreadPoolExecutor(max_workers=WALK_WORKERS) as ex:
+        while q:
             batch = []
-            while queue and len(batch) < 64:
-                batch.append(queue.popleft())
-            for fid, pre in batch:
-                futs[ex.submit(list_folder, fid)] = (fid, pre)
+            while q and len(batch) < 48:
+                batch.append(q.popleft())
+            futs = {ex.submit(list_folder, fid): (fid, pre) for fid, pre in batch}
             for fut in as_completed(futs):
                 fid, pre = futs[fut]
                 try:
                     files = fut.result()
                 except Exception as e:
-                    log("folder list failed, queued for rescan:", pre or "/",
-                        str(e)[:100])
+                    log("folder list failed, rescan later:", pre or "/", str(e)[:100])
                     failed.append((fid, pre))
                     continue
                 for f in files:
                     rel = f"{pre}/{f['name']}" if pre else f["name"]
                     if f["mimeType"] == "application/vnd.google-apps.folder":
-                        queue.append((f["id"], rel))
+                        q.append((f["id"], rel))
                     else:
-                        with lock:
-                            results.append((rel, f["id"],
-                                            int(f.get("size", 0))))
-                            STATE["scanned"] = len(results)
+                        emit(rel, f["id"], int(f.get("size", 0)))
     for fid, pre in failed:
-        queue.append((fid, pre))
-    retry_failed = []
-    while queue:
-        fid, pre = queue.popleft()
+        q.append((fid, pre))
+    missed = 0
+    while q:
+        fid, pre = q.popleft()
         try:
             files = list_folder(fid)
         except Exception as e:
             log("rescan failed:", pre or "/", str(e)[:100])
-            retry_failed.append(pre or "/")
+            missed += 1
             continue
         for f in files:
             rel = f"{pre}/{f['name']}" if pre else f["name"]
             if f["mimeType"] == "application/vnd.google-apps.folder":
-                queue.append((f["id"], rel))
+                q.append((f["id"], rel))
             else:
-                results.append((rel, f["id"], int(f.get("size", 0))))
-                STATE["scanned"] = len(results)
-    if retry_failed:
-        log("SCAN INCOMPLETE, folders missed:", len(retry_failed))
-        STATE["phase"] = "传输中（扫描缺 " + str(len(retry_failed)) + " 个文件夹，下轮补）"
-    return results
+                emit(rel, f["id"], int(f.get("size", 0)))
+    for it in extra_items:
+        emit(*it)
+    with _LOCK:
+        STATE["scan_done"] = True
+        STATE["total"] = STATE["scanned"]
+        if missed:
+            STATE["phase"] = f"传输中（扫描缺 {missed} 个文件夹，下轮补）"
+    log(f"walk done: {STATE['scanned']} items, missed folders: {missed}")
+    for _ in range(TRANSFER_WORKERS):
+        item_q.put(None)
+
+
+# ---------------- 传输 ----------------
+def transfer_one(alist, item):
+    rel, fid, size = item
+    qpath = QROOT + "/" + rel
+    have = alist.quark_map(os.path.dirname(qpath))
+    if have.get(os.path.basename(qpath)) == size:
+        with _LOCK:
+            STATE["skip"] += 1
+            STATE["done_bytes_all"] += size
+        return
+    local = os.path.join(STAGE, f"{fid}_{os.path.basename(qpath)}")
+    try:
+        with open(local, "wb") as fh:
+            dl = MediaIoBaseDownload(
+                fh, drive_service().files().get_media(fileId=fid))
+            done = False
+            while not done:
+                _, done = dl.next_chunk(num_retries=5)
+        alist.put(local, qpath, size)
+        with _LOCK:
+            STATE["ok"] += 1
+            STATE["bytes"] += size
+            STATE["done_bytes_all"] += size
+    finally:
+        if os.path.isfile(local):
+            os.remove(local)
+
+
+def transfer_worker(wid, alist, item_q):
+    while True:
+        if budget_left() < 120:
+            log(f"worker {wid}: budget reached, exit")
+            return
+        try:
+            item = item_q.get(timeout=30)
+        except queue.Empty:
+            if STATE["scan_done"]:
+                return
+            continue
+        if item is None:
+            return
+        with _LOCK:
+            STATE["current"][wid] = item[0]
+        try:
+            transfer_one(alist, item)
+        except Exception as e:
+            with _LOCK:
+                STATE["fail"] += 1
+            log("FAIL", item[0], str(e)[:140])
+        finally:
+            with _LOCK:
+                STATE["current"].pop(wid, None)
+        if (STATE["ok"] + STATE["skip"]) % 100 == 0 and STATE["ok"] + STATE["skip"] > 0:
+            log(f"progress: ok={STATE['ok']} skip={STATE['skip']} "
+                f"fail={STATE['fail']} bytes={STATE['done_bytes_all']/1e9:.2f}GB "
+                f"budget_left={budget_left()/60:.0f}m")
 
 
 def main():
     os.makedirs(STAGE, exist_ok=True)
-    import threading
     rep = ProgressReporter()
     th = threading.Thread(target=rep.run, daemon=True)
     th.start()
     alist = Alist()
     alist.start()
     alist.mount_quark()
-    svc = _build_service()
+    svc = _make_service()
 
     kids = execute_retry(svc.files().list(
         q=f"'{DRIVE_ROOT}' in parents and name='media' and trashed=false",
         fields="files(id)")).get("files", [])
     if not kids:
         raise RuntimeError("media/ not found under DRIVE_ROOT (check SA sharing)")
-    STATE["phase"] = "扫描网盘文件树"
-    items = drive_walk(svc, kids[0]["id"], "media")
-    if not STATE["phase"].startswith("传输中"):
-        STATE["phase"] = "传输中"
-    STATE["total"] = len(items)
-    STATE["total_bytes"] = sum(x[2] for x in items)
+    extra = []
+    meta = execute_retry(svc.files().list(
+        q=f"'{DRIVE_ROOT}' in parents and name='hell_grind_metadata.zip' and trashed=false",
+        fields="files(id,name,size)")).get("files", [])
+    for f in meta:
+        extra.append((f["name"], f["id"], int(f.get("size", 0))))
     if INCLUDE_FILM:
         films = execute_retry(svc.files().list(
             q=f"'{DRIVE_ROOT}' in parents and name contains '.mov' and trashed=false",
             fields="files(id,name,size)")).get("files", [])
         for f in films:
-            items.append((f["name"], f["id"], int(f.get("size", 0))))
-    meta = execute_retry(svc.files().list(
-        q=f"'{DRIVE_ROOT}' in parents and name='hell_grind_metadata.zip' and trashed=false",
-        fields="files(id,name,size)")).get("files", [])
-    for f in meta:
-        items.append((f["name"], f["id"], int(f.get("size", 0))))
-    log(f"drive items: {len(items)}")
+            extra.append((f["name"], f["id"], int(f.get("size", 0))))
 
-    n_ok = n_skip = n_fail = 0
-    done_bytes = 0
-
-    def one(item):
-        rel, fid, size = item
-        qpath = QROOT + "/" + rel
-        have = alist.quark_map(os.path.dirname(qpath))
-        if have.get(os.path.basename(qpath)) == size:
-            return ("skip", rel, 0)
-        local = os.path.join(STAGE, f"{fid}_{os.path.basename(qpath)}")
-        try:
-            with open(local, "wb") as fh:
-                dl = MediaIoBaseDownload(
-                    fh, drive_service().files().get_media(fileId=fid))
-                done = False
-                while not done:
-                    _, done = dl.next_chunk(num_retries=5)
-            alist.put(local, qpath, size)
-            return ("ok", rel, size)
-        finally:
-            if os.path.isfile(local):
-                os.remove(local)
-
-    pending = list(items)
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        while pending:
-            if budget_left() < 300:
-                log(f"budget reached; {len(pending)} items left for next run")
-                break
-            batch, pending = pending[:20], pending[20:]
-            futs = {ex.submit(one, it): it for it in batch}
-            for fut in as_completed(futs):
-                try:
-                    kind, rel, size = fut.result()
-                    if kind == "ok":
-                        n_ok += 1
-                        done_bytes += size
-                    elif kind == "skip":
-                        n_skip += 1
-                        done_bytes += futs[fut][2]
-                except Exception as e:
-                    n_fail += 1
-                    log("FAIL", futs[fut][0], str(e)[:160])
-                STATE.update(ok=n_ok, skip=n_skip, fail=n_fail, bytes=done_bytes)
-            log(f"progress: ok={n_ok} skip={n_skip} fail={n_fail} "
-                f"bytes={done_bytes/1e9:.2f}GB budget_left={budget_left()/60:.0f}m")
-    STATE["phase"] = "本轮结束（重跑 workflow 续传剩余部分）"
-    STATE.update(ok=n_ok, skip=n_skip, fail=n_fail, bytes=done_bytes)
-    log(f"DONE ok={n_ok} skip={n_skip} fail={n_fail} bytes={done_bytes/1e9:.2f}GB")
+    STATE["phase"] = "传输中（边扫边传）"
+    item_q = queue.Queue(maxsize=1000)
+    prod = threading.Thread(target=walk_producer,
+                            args=(kids[0]["id"], "media", item_q, extra),
+                            daemon=True)
+    prod.start()
+    with ThreadPoolExecutor(max_workers=TRANSFER_WORKERS) as ex:
+        futs = [ex.submit(transfer_worker, w, alist, item_q)
+                for w in range(TRANSFER_WORKERS)]
+        for f in futs:
+            f.result()
+    with _LOCK:
+        STATE["phase"] = "本轮结束（重跑 workflow 续传剩余部分）"
+    log(f"DONE ok={STATE['ok']} skip={STATE['skip']} fail={STATE['fail']} "
+        f"bytes={STATE['done_bytes_all']/1e9:.2f}GB scanned={STATE['scanned']}")
     rep.stop = True
     th.join(timeout=40)
     return 0
