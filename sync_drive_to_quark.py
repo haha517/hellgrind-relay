@@ -219,23 +219,24 @@ import threading as _th
 _TLS = _th.local()
 
 
+_SA_INFO = json.loads(SA_JSON)
+_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+
+def _make_service():
+    creds = service_account.Credentials.from_service_account_info(
+        _SA_INFO, scopes=_SCOPES)
+    return build("drive", "v3", credentials=creds)
+
+
 def drive_service():
     if getattr(_TLS, "svc", None) is None:
-        with open("/tmp/sa.json", "w") as f:
-            f.write(SA_JSON)
-        creds = service_account.Credentials.from_service_account_file(
-            "/tmp/sa.json",
-            scopes=["https://www.googleapis.com/auth/drive.readonly"])
-        _TLS.svc = build("drive", "v3", credentials=creds)
+        _TLS.svc = _make_service()
     return _TLS.svc
 
 
 def _build_service():
-    with open("/tmp/sa.json", "w") as f:
-        f.write(SA_JSON)
-    creds = service_account.Credentials.from_service_account_file(
-        "/tmp/sa.json", scopes=["https://www.googleapis.com/auth/drive.readonly"])
-    return build("drive", "v3", credentials=creds)
+    return _make_service()
 
 
 def drive_walk(svc, folder_id, prefix=""):
