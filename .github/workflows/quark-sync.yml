@@ -16,6 +16,9 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -42,4 +45,5 @@ jobs:
           DRIVE_ROOT_ID: "1ZtIeCOD69NZ8F_8XECr_dnz6c1z8NjUk"
           BUDGET_MINUTES: ${{ inputs.budget_minutes }}
           INCLUDE_FILM: ${{ inputs.include_film }}
+          GH_TOKEN: ${{ github.token }}
         run: python3 sync_drive_to_quark.py
