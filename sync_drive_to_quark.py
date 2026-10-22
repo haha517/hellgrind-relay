@@ -25,7 +25,7 @@ GH_REPO = os.environ.get("GITHUB_REPOSITORY", "")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 QROOT = "/quark/HellGrind"  # /quark 是 Alist 挂载点，必须带
 STAGE = "/tmp/stage"
-TRANSFER_WORKERS = 4
+TRANSFER_WORKERS = 12
 WALK_WORKERS = 6
 T0 = time.time()
 
