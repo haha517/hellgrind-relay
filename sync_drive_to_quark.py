@@ -239,21 +239,46 @@ def _build_service():
 
 
 def drive_walk(svc, folder_id, prefix=""):
-    page = None
-    while True:
-        r = execute_retry(svc.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="files(id,name,mimeType,size),nextPageToken",
-            pageSize=1000, pageToken=page))
-        for f in r.get("files", []):
-            rel = f"{prefix}/{f['name']}" if prefix else f["name"]
-            if f["mimeType"] == "application/vnd.google-apps.folder":
-                yield from drive_walk(svc, f["id"], rel)
-            else:
-                yield rel, f["id"], int(f.get("size", 0))
-        page = r.get("nextPageToken")
-        if not page:
-            return
+    """并行 BFS 遍历：16 线程并发列文件夹（每线程独立 Drive service）。"""
+    from collections import deque
+    results = []
+    lock = _th.Lock()
+
+    def list_folder(fid):
+        svc_l = drive_service()
+        out = []
+        page = None
+        while True:
+            r = execute_retry(svc_l.files().list(
+                q=f"'{fid}' in parents and trashed=false",
+                fields="files(id,name,mimeType,size),nextPageToken",
+                pageSize=1000, pageToken=page))
+            out.extend(r.get("files", []))
+            page = r.get("nextPageToken")
+            if not page:
+                return out
+
+    queue = deque([(folder_id, prefix)])
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        while queue:
+            futs = {}
+            batch = []
+            while queue and len(batch) < 64:
+                batch.append(queue.popleft())
+            for fid, pre in batch:
+                futs[ex.submit(list_folder, fid)] = (fid, pre)
+            for fut in as_completed(futs):
+                fid, pre = futs[fut]
+                for f in fut.result():
+                    rel = f"{pre}/{f['name']}" if pre else f["name"]
+                    if f["mimeType"] == "application/vnd.google-apps.folder":
+                        queue.append((f["id"], rel))
+                    else:
+                        with lock:
+                            results.append((rel, f["id"],
+                                            int(f.get("size", 0))))
+                            STATE["scanned"] = len(results)
+    return results
 
 
 def main():
@@ -273,10 +298,7 @@ def main():
     if not kids:
         raise RuntimeError("media/ not found under DRIVE_ROOT (check SA sharing)")
     STATE["phase"] = "扫描网盘文件树"
-    items = []
-    for _it in drive_walk(svc, kids[0]["id"], "media"):
-        items.append(_it)
-        STATE["scanned"] = len(items)
+    items = drive_walk(svc, kids[0]["id"], "media")
     STATE["phase"] = "传输中"
     STATE["total"] = len(items)
     STATE["total_bytes"] = sum(x[2] for x in items)
