@@ -195,6 +195,23 @@ class Alist:
             self._qcache[qdir] = out
         return out
 
+    _dirs_done = set()
+
+    def ensure_dir(self, qdir):
+        """逐级建目录（已建过的跳过）；mkdir 失败不抛，交给 put 的结果说话。"""
+        parts = [p for p in qdir.split("/") if p]
+        cur = ""
+        for p in parts:
+            cur += "/" + p
+            with self._qlock:
+                if cur in self._dirs_done:
+                    continue
+                self._dirs_done.add(cur)
+            try:
+                self.api("/api/fs/mkdir", {"path": cur})
+            except Exception:
+                pass
+
     def put(self, local, qpath, size):
         import urllib.parse
         with open(local, "rb") as fh:
@@ -352,6 +369,7 @@ def transfer_one(alist, item):
             done = False
             while not done:
                 _, done = dl.next_chunk(num_retries=5)
+        alist.ensure_dir(os.path.dirname(qpath))
         alist.put(local, qpath, size)
         with _LOCK:
             STATE["ok"] += 1
@@ -382,7 +400,7 @@ def transfer_worker(wid, alist, item_q):
         except Exception as e:
             with _LOCK:
                 STATE["fail"] += 1
-            log("FAIL", item[0], str(e)[:140])
+            log("FAIL", item[0], str(e)[:300])
         finally:
             with _LOCK:
                 STATE["current"].pop(wid, None)
